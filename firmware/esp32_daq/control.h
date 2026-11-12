@@ -30,7 +30,7 @@ static const float TS = 0.05f;            /* sampling period [s]; use the SAME v
 static const float KP_THETA    = 3.0f;    /* inner loop gain */
 static const float R_THETA_LIM = 4.0f;    /* r_theta saturation [V] */
 static const float U_LIM       = 10.0f;   /* u saturation [V] (output limit) */
-static const float TH_LIM      = 5.0f;    /* maximum |theta| [V]: above it the run is stopped (u = 0) */
+static const float TH_LIM      = 10.0f;   /* maximum |theta| [V]: above it the run is stopped (u = 0) */
 
 static const float T_STEP = 1.0f;         /* instant of the reference step [s] */
 static const float RX_DEFAULT  = 0.5f;    /* r_x step (MODEs 1 and 2, REF_SEQ 0) */
@@ -75,12 +75,20 @@ float reference_x(float t, float step) {
 }
 
 /* ---------------------------------------------------------------- outer loop (MODEs 1 and 2) */
-/* Difference equation of the x controller, obtained from MATLAB c2d:
- *   u[k] = bC(1) e[k] + bC(2) e[k-1] + ... - aC(2) u[k-1] - aC(3) u[k-2] - ...    with aC(1) = 1
- * ORDER = order of the discrete controller (number of poles). The history is cleared in control_reset(). */
+/* Continuous controller (from P_07, with K_B = kii = 1.4, z1 = 0.75, alfa = 8, p1 = 6):
+ *   k = alfa^(3/2) * z1^2 / K_B = 8^(1.5) * 0.75^2 / 1.4 = 9.091373
+ *   C_x(s) = 9.091373 * (s + 0.75) / (s + 6)
+ *
+ * Discretized with c2d(C, Ts, 'zoh') at TS = 0.05 s (normalized by aC(1) = 1):
+ *   C_d(z) = (9.091373 - 8.796833 z^-1) / (1 - 0.740818 z^-1)
+ *
+ * Difference equation:
+ *   u[k] = bC[0]*e[k] + bC[1]*e[k-1] - aC[1]*u[k-1]
+ *        = 9.091373*e[k] - 8.796833*e[k-1] + 0.740818*u[k-1]
+ * ORDER = 1 (first-order lead controller). The history is cleared in control_reset(). */
 #define ORDER 1
-static const float bC[ORDER + 1] = { 0.0f, 0.0f };   /* TODO: numerator from tfdata (bC / aC(1)) */
-static const float aC[ORDER + 1] = { 1.0f, 0.0f };   /* TODO: denominator from tfdata (aC / aC(1)); aC[0] = 1 */
+static const float bC[ORDER + 1] = { 9.091373f, -8.796833f }; /* numerator from tfdata(c2d(C, 0.05, 'zoh'), 'v') */
+static const float aC[ORDER + 1] = { 1.0f,      -0.740818f }; /* denominator from tfdata(c2d(C, 0.05, 'zoh'), 'v'); aC[0] = 1 */
 static float e_h[ORDER + 1];                         /* e[k], e[k-1], ... */
 static float u_h[ORDER + 1];                         /* u[k], u[k-1], ... */
 

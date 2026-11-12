@@ -31,9 +31,14 @@ TS = 0.05
 def serial_ports():
     from serial.tools import list_ports
     ps = list(list_ports.comports())
-    pref = [p.device for p in ps if any(s in (p.device + (p.description or "")).lower()
-                                        for s in ("usbserial", "slab", "wch", "ttyusb", "ttyacm", "cp210", "ch340", "usb"))]
-    return pref or [p.device for p in ps]
+    keys = ("usbserial", "slab", "wch", "ttyusb", "ttyacm", "cp210", "ch34", "ch91",
+            "ftdi", "silicon", "espressif", "10c4", "1a86", "303a", "0403", "usb")
+    pref = [p.device for p in ps if any(
+        s in f"{p.device} {p.description or ''} {p.hwid or ''} {p.manufacturer or ''}".lower()
+        for s in keys
+    )]
+    other = [p.device for p in ps if p.device not in pref]
+    return pref + other
 
 
 class Link:
@@ -41,27 +46,44 @@ class Link:
 
     def __init__(self, port):
         import serial
-        self.ser = serial.Serial(port, 115200, timeout=0.1)
-        time.sleep(2.5)                                        # the ESP32 resets when the port is opened
-        self.ser.reset_input_buffer()
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = 115200
+        self.ser.timeout = 0.05
+        self.ser.write_timeout = 0.5
+        self.ser.dtr = False                                   # avoid holding ESP32 in reset/bootloader on Windows
+        self.ser.rts = False
+        self.ser.open()
+        try:
+            self.ser.dtr = False
+            self.ser.rts = False
+        except Exception:
+            pass
         self.lock = threading.Lock()
         self.rows = []
         self.msgs = collections.deque(maxlen=200)
         self.running, self.finished, self.reason = False, False, ""
         self.mode, self.t_end, self.rx, self.rth = 0, 8.0, 0.5, 1.0
         self.reading = None                                    # last reply to R: dict(theta, v2, x)
+        self.ready = False
         self.alive = True
         threading.Thread(target=self._rx, daemon=True).start()
-        self.send("S")
-        self.send("?")
+        t0 = time.time()
+        while time.time() - t0 < 2.8 and not self.ready:
+            self.send("S")
+            self.send("?")
+            time.sleep(0.35)
 
     def _rx(self):
         buf = b""
         while self.alive:
             try:
-                chunk = self.ser.read(2048)
+                n = self.ser.in_waiting
+                chunk = self.ser.read(n or 1)
             except Exception:
                 break
+            if not chunk:
+                continue
             buf += chunk
             while b"\n" in buf:
                 raw, buf = buf.split(b"\n", 1)
@@ -73,6 +95,7 @@ class Link:
 
     def _line(self, line):
         if line.startswith("#L") and line[2:3].isdigit():
+            self.ready = True
             try:
                 v = [float(a) for a in line[2:].split(",")]
             except ValueError:
@@ -83,6 +106,7 @@ class Link:
             return
         if not line.startswith("#"):
             return
+        self.ready = True
         self.msgs.append(line)
         kv = self._kv(line)
         try:
@@ -93,26 +117,38 @@ class Link:
                 self.mode, self.t_end = int(kv["mode"]), float(kv["t_end"])
             elif line.startswith("#READ"):
                 self.reading = {k: float(v) for k, v in kv.items()}
-            elif line.startswith("#STATUS"):
-                self.mode, self.rx, self.rth = int(kv["mode"]), float(kv["rx"]), float(kv["rth"])
+            elif line.startswith("#STATUS") or line.startswith("#DAQ"):
+                if "mode" in kv:
+                    self.mode = int(kv["mode"])
+                if "rx" in kv:
+                    self.rx = float(kv["rx"])
+                if "rth" in kv:
+                    self.rth = float(kv["rth"])
             elif line.startswith("#STOP"):
                 self.running, self.finished, self.reason = False, True, line.split()[1]
         except (KeyError, ValueError, IndexError):
             pass
 
     def send(self, cmd):
-        self.ser.write((cmd + "\n").encode())
+        try:
+            self.ser.write((cmd + "\n").encode())
+        except Exception:
+            pass
 
     def data(self):
         with self.lock:
             return np.array(self.rows) if self.rows else np.zeros((0, len(FIELDS)))
 
     def close(self):
+        self.alive = False
         try:
             self.ser.write(b"S\n")
         except Exception:
             pass
-        self.alive = False
+        try:
+            self.ser.close()
+        except Exception:
+            pass
 
 
 class DemoLink(Link):
@@ -153,15 +189,13 @@ class DemoLink(Link):
     def _run(self):
         rng = np.random.default_rng(7)
         KB, kp_th, KP, KD, sat_r = 0.24, 3.0, 9.0, 8.5, 4.0         # plant and x controller (example)
-        t_end = self.t_end
         with self.lock:
             self.rows = []
         self.running, self.finished, self.reason = True, False, ""
         x = v = th = 0.0
         r_x = 0.0
-        for k in range(int(t_end / TS) + 1):
-            if self._stop:
-                break
+        k = 0
+        while not self._stop and self.alive:
             t = k * TS
             if t >= 1.0 and (t - 1.0) % 5.0 < TS / 2:               # every 5 s: new step (change <= 0.5)
                 r_x = float(np.clip(r_x + rng.uniform(-0.5, 0.5), -0.8, 0.8))
@@ -177,6 +211,7 @@ class DemoLink(Link):
             row = [k, t, r_x, r_th, x + rng.normal(0, 0.004), th + rng.normal(0, 0.01), u]
             with self.lock:
                 self.rows.append(row)
+            k += 1
             time.sleep(TS / self.speed)
         self.running, self.finished, self.reason = False, True, "S" if self._stop else "end"
 
@@ -253,7 +288,15 @@ def run_gui(port, demo=False, speed=1.0):
 
     bar = ttk.Frame(root, padding=6)
     bar.pack(fill="x")
-    cb = ttk.Combobox(bar, width=24, values=serial_ports())
+
+    def refresh_ports():
+        if not demo:
+            ps = serial_ports()
+            cb["values"] = ps
+            if not cb.get() and ps:
+                cb.set(ps[0])
+
+    cb = ttk.Combobox(bar, width=24, values=serial_ports(), postcommand=refresh_ports)
     cb.pack(side="left")
     if demo:
         cb.set("simulation (no ESP32)")
@@ -303,15 +346,33 @@ def run_gui(port, demo=False, speed=1.0):
         if st["link"]:
             st["link"].close()
             st["link"] = None
-        try:
-            st["link"] = DemoLink(speed=speed) if demo else Link(cb.get())
-        except Exception as e:                                  # port missing / busy
-            lbl.config(text=f"error: {e}", foreground=ERR)
-            return
-        time.sleep(0.3)
+        if demo:
+            st["link"] = DemoLink(speed=speed)
+        else:
+            refresh_ports()
+            target = cb.get().strip()
+            candidates = ([target] if target else []) + [p for p in serial_ports() if p != target]
+            if not candidates:
+                lbl.config(text="no serial port found — check USB cable / driver", foreground=ERR)
+                return
+            last_err = None
+            for p in candidates:
+                try:
+                    lnk = Link(p)
+                    if lnk.ready or len(candidates) == 1:
+                        st["link"] = lnk
+                        cb.set(p)
+                        break
+                    lnk.close()
+                except Exception as e:
+                    last_err = e
+            if not st["link"]:
+                lbl.config(text=f"error: {last_err or 'ESP32 did not respond'}", foreground=ERR)
+                return
+        time.sleep(0.1)
         v_rx.set(f"{st['link'].rx:g}")
         v_rth.set(f"{st['link'].rth:g}")
-        lbl.config(text=f"connected — mode {st['link'].mode} ({MODES.get(st['link'].mode, '?')})", foreground="")
+        lbl.config(text=f"connected ({cb.get()}) — mode {st['link'].mode} ({MODES.get(st['link'].mode, '?')})", foreground="")
         apply_x()
 
     def start():
@@ -390,8 +451,12 @@ def run_gui(port, demo=False, speed=1.0):
             if len(d):
                 for key, col in (("r_x", 2), ("x", 4), ("r_theta", 3), ("theta", 5), ("u", 6)):
                     ln[key].set_data(d[:, 1], d[:, col])
+                t_now = float(d[-1, 1])
+                t_win = min(10.0, max(k.t_end, 1.0))
+                x0 = max(0.0, t_now - t_win)
+                x1 = max(t_win, t_now)
                 for a in ax:
-                    a.set_xlim(0, max(k.t_end, 1.0))
+                    a.set_xlim(x0, x1)
                     a.relim()
                     a.autoscale_view(scalex=False)
                 canvas.draw_idle()
@@ -413,7 +478,7 @@ def run_gui(port, demo=False, speed=1.0):
 
     root.bind("<Escape>", lambda e: stop())
     root.protocol("WM_DELETE_WINDOW", close_window)
-    if port or demo:
+    if port or demo or cb.get():
         connect()
     tick()
     root.mainloop()
