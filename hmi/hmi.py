@@ -186,21 +186,52 @@ class DemoLink(Link):
             x = 2 * (v2 - self.xmin) / (self.xmax - self.xmin) - 1
             self.reading = {"theta": 0.02, "v2": v2, "x": x}
 
+    @staticmethod
+    def _control_params():
+        import math, re
+        vals = {"CTRL_Z1": 1.0, "CTRL_ALFA": 7.5, "CTRL_KII": 1.4,
+                "KP_THETA": 3.0, "R_THETA_LIM": 4.0, "U_LIM": 10.0}
+        ctrl_h = HERE.parent / "firmware" / "esp32_daq" / "control.h"
+        try:
+            txt = ctrl_h.read_text(encoding="utf-8", errors="ignore")
+            for name in list(vals):
+                m = re.search(rf"\b{name}\s*=\s*([+-]?\d+(?:\.\d+)?)\s*f?\s*;", txt)
+                if m:
+                    vals[name] = float(m.group(1))
+        except OSError:
+            pass
+        z1, alfa, kii = vals["CTRL_Z1"], vals["CTRL_ALFA"], vals["CTRL_KII"]
+        p1 = alfa * z1
+        k_gain = (alfa ** 1.5) * (z1 ** 2) / kii
+        ez, ep = math.exp(-z1 * TS), math.exp(-p1 * TS)
+        return {
+            "KB": kii, "kp_th": vals["KP_THETA"], "sat_r": vals["R_THETA_LIM"], "u_lim": vals["U_LIM"],
+            "bF1": 1.0 - ez, "aF1": -ez,
+            "bC0": k_gain, "bC1": -k_gain * (1.0 - (z1 / p1) * (1.0 - ep)), "aC1": -ep,
+        }
+
     def _run(self):
         rng = np.random.default_rng(7)
-        KB, kp_th, KP, KD, sat_r = 0.24, 3.0, 9.0, 8.5, 4.0         # plant and x controller (example)
+        p = self._control_params()
+        KB, kp_th, sat_r, u_lim = p["KB"], p["kp_th"], p["sat_r"], p["u_lim"]
         with self.lock:
             self.rows = []
         self.running, self.finished, self.reason = True, False, ""
         x = v = th = 0.0
         r_x = 0.0
+        rx_prev = rxf_prev = e_prev = u_prev = 0.0
         k = 0
         while not self._stop and self.alive:
             t = k * TS
             if t >= 1.0 and (t - 1.0) % 5.0 < TS / 2:               # every 5 s: new step (change <= 0.5)
                 r_x = float(np.clip(r_x + rng.uniform(-0.5, 0.5), -0.8, 0.8))
-            r_th = float(np.clip(KP * (r_x - x) - KD * v, -sat_r, sat_r))
-            u = float(np.clip(kp_th * (r_th - th), -10, 10))
+            r_xf = p["bF1"] * rx_prev - p["aF1"] * rxf_prev         # pre-filter Fx(z)
+            rx_prev, rxf_prev = r_x, r_xf
+            e = r_xf - x
+            r_th_unsat = p["bC0"] * e + p["bC1"] * e_prev - p["aC1"] * u_prev   # controller Cx(z)
+            e_prev, u_prev = e, r_th_unsat
+            r_th = float(np.clip(r_th_unsat, -sat_r, sat_r))
+            u = float(np.clip(kp_th * (r_th - th), -u_lim, u_lim))
             for _ in range(5):                                      # integrate the plant (Euler)
                 h = TS / 5
                 th += h * (7.0 / kp_th) * u                         # beam: inner loop with a pole at ~7 rad/s

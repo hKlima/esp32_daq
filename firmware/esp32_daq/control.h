@@ -75,24 +75,58 @@ float reference_x(float t, float step) {
 }
 
 /* ---------------------------------------------------------------- outer loop (MODEs 1 and 2) */
-/* Continuous controller (from P_07, with K_B = kii = 1.4, z1 = 0.75, alfa = 8, p1 = 6):
- *   k = alfa^(3/2) * z1^2 / K_B = 8^(1.5) * 0.75^2 / 1.4 = 9.091373
- *   C_x(s) = 9.091373 * (s + 0.75) / (s + 6)
+/* 2-DOF controller parameters (from MATLAB):
+ *   z1   = 1.0
+ *   alfa = 7.5
+ *   kii  = 1.4  (K_B)
+ *   p1   = alfa * z1 = 7.5
+ *   k    = alfa^(3/2) * z1^2 / kii = 14.671140
+ *   Fx(s) = z1 / (s + z1)
+ *   Cx(s) = k * (s + z1) / (s + p1)
  *
- * Discretized with c2d(C, Ts, 'zoh') at TS = 0.05 s (normalized by aC(1) = 1):
- *   C_d(z) = (9.091373 - 8.796833 z^-1) / (1 - 0.740818 z^-1)
+ * Both Fx(s) and Cx(s) are discretized with c2d(..., TS, 'zoh') at TS = 0.05 s
+ * inside control_reset() from the parameters below (normalized by a[0] = 1):
+ *   Fd(z): bF = { 0, 1 - exp(-z1*TS) },                    aF = { 1, -exp(-z1*TS) }
+ *   Cd(z): bC = { k, -k*(1 - (z1/p1)*(1 - exp(-p1*TS))) }, aC = { 1, -exp(-p1*TS) }
  *
- * Difference equation:
- *   u[k] = bC[0]*e[k] + bC[1]*e[k-1] - aC[1]*u[k-1]
- *        = 9.091373*e[k] - 8.796833*e[k-1] + 0.740818*u[k-1]
- * ORDER = 1 (first-order lead controller). The history is cleared in control_reset(). */
+ * Difference equations:
+ *   r_xf[k] = bF[0]*r_x[k] + bF[1]*r_x[k-1] - aF[1]*r_xf[k-1]
+ *   e[k]    = r_xf[k] - x[k]
+ *   u[k]    = bC[0]*e[k] + bC[1]*e[k-1] - aC[1]*u[k-1]
+ * ORDER = 1. All states are cleared in control_reset(). */
+static const float CTRL_Z1   = 1.0f;                 /* zero of Cx(s) and pole of Fx(s) */
+static const float CTRL_ALFA = 6.1f;                 /* lead ratio (p1 = alfa * z1) */
+static const float CTRL_KII  = 1.4f;                 /* plant gain K_B */
+
 #define ORDER 1
-static const float bC[ORDER + 1] = { 9.091373f, -8.796833f }; /* numerator from tfdata(c2d(C, 0.05, 'zoh'), 'v') */
-static const float aC[ORDER + 1] = { 1.0f,      -0.740818f }; /* denominator from tfdata(c2d(C, 0.05, 'zoh'), 'v'); aC[0] = 1 */
+static float bF[2];                                  /* pre-filter Fx(z) numerator */
+static float aF[2];                                  /* pre-filter Fx(z) denominator (aF[0] = 1) */
+static float rx_prev, rxf_prev;                      /* pre-filter states: r_x[k-1], r_xf[k-1] */
+
+static float bC[ORDER + 1];                          /* controller Cx(z) numerator */
+static float aC[ORDER + 1];                          /* controller Cx(z) denominator (aC[0] = 1) */
 static float e_h[ORDER + 1];                         /* e[k], e[k-1], ... */
 static float u_h[ORDER + 1];                         /* u[k], u[k-1], ... */
 
 void control_reset() {
+  float p1 = CTRL_ALFA * CTRL_Z1;
+  float k  = powf(CTRL_ALFA, 1.5f) * (CTRL_Z1 * CTRL_Z1) / CTRL_KII;
+  float ez = expf(-CTRL_Z1 * TS);
+  float ep = expf(-p1 * TS);
+
+  /* Discretized pre-filter Fx(s) = z1 / (s + z1) via ZOH */
+  bF[0] = 0.0f;
+  bF[1] = 1.0f - ez;
+  aF[0] = 1.0f;
+  aF[1] = -ez;
+
+  /* Discretized controller Cx(s) = k * (s + z1) / (s + p1) via ZOH */
+  bC[0] = k;
+  bC[1] = -k * (1.0f - (CTRL_Z1 / p1) * (1.0f - ep));
+  aC[0] = 1.0f;
+  aC[1] = -ep;
+
+  rx_prev = 0.0f; rxf_prev = 0.0f;
   for (int i = 0; i <= ORDER; i++) { e_h[i] = 0.0f; u_h[i] = 0.0f; }
   rng_s = SEED; seq_n = -1; seq_r = 0.0f;
 }
@@ -100,8 +134,14 @@ void control_reset() {
 /* Called every TS. Returns r_theta [V]; the program saturates it at +-R_THETA_LIM
  * (the difference equation keeps the unsaturated value, as in the MATLAB simulation). */
 float outer_control(float r_x, float x) {
+  /* 1) Pre-filter on reference: r_xf[k] = bF[0]*r_x[k] + bF[1]*r_x[k-1] - aF[1]*r_xf[k-1] */
+  float r_xf = bF[0] * r_x + bF[1] * rx_prev - aF[1] * rxf_prev;
+  rx_prev = r_x;
+  rxf_prev = r_xf;
+
+  /* 2) Lead controller on filtered error: e[k] = r_xf[k] - x[k] */
   for (int i = ORDER; i > 0; i--) { e_h[i] = e_h[i - 1]; u_h[i] = u_h[i - 1]; }   /* shift the history */
-  e_h[0] = r_x - x;                                                                /* current error */
+  e_h[0] = r_xf - x;                                                               /* current error */
 
   float u = 0.0f;
   for (int i = 0; i <= ORDER; i++) u += bC[i] * e_h[i];
