@@ -166,6 +166,15 @@ class DemoLink(Link):
         self.speed = speed
         self.xmin, self.xmax = -10.0, 10.0
         self._stop = False
+        d = self._read_control_defaults()
+        self.z1 = d["CTRL_Z1"]
+        self.alfa = d["CTRL_ALFA"]
+        self.kii = d["CTRL_KII"]
+        self.fx_mult = d["CTRL_FX_MULT"]
+        self.kp_th = d["KP_THETA"]
+        self.sat_r = d["R_THETA_LIM"]
+        self.u_lim = d["U_LIM"]
+        self.use_fx = True
 
     def send(self, cmd):
         c, arg = cmd[:1], cmd[1:]
@@ -187,9 +196,9 @@ class DemoLink(Link):
             self.reading = {"theta": 0.02, "v2": v2, "x": x}
 
     @staticmethod
-    def _control_params():
-        import math, re
-        vals = {"CTRL_Z1": 1.0, "CTRL_ALFA": 7.5, "CTRL_KII": 1.4,
+    def _read_control_defaults():
+        import re
+        vals = {"CTRL_Z1": 1.0, "CTRL_ALFA": 6.1, "CTRL_KII": 1.4, "CTRL_FX_MULT": 1.0,
                 "KP_THETA": 3.0, "R_THETA_LIM": 4.0, "U_LIM": 10.0}
         ctrl_h = HERE.parent / "firmware" / "esp32_daq" / "control.h"
         try:
@@ -200,12 +209,28 @@ class DemoLink(Link):
                     vals[name] = float(m.group(1))
         except OSError:
             pass
-        z1, alfa, kii = vals["CTRL_Z1"], vals["CTRL_ALFA"], vals["CTRL_KII"]
+        return vals
+
+    def set_sim_params(self, z1, alfa, kii, kp_th, fx_mult=1.0, use_fx=True):
+        if z1 <= 0 or alfa <= 0 or kii <= 0 or kp_th <= 0 or fx_mult <= 0:
+            raise ValueError("z1, alfa, kii, Kp and m_Fx must be > 0")
+        self.z1 = float(z1)
+        self.alfa = float(alfa)
+        self.kii = float(kii)
+        self.kp_th = float(kp_th)
+        self.fx_mult = float(fx_mult)
+        self.use_fx = bool(use_fx)
+
+    def _control_params(self):
+        import math
+        z1, alfa, kii, fx_mult = self.z1, self.alfa, self.kii, self.fx_mult
         p1 = alfa * z1
+        pf = fx_mult * z1
         k_gain = (alfa ** 1.5) * (z1 ** 2) / kii
-        ez, ep = math.exp(-z1 * TS), math.exp(-p1 * TS)
+        ez, ep = math.exp(-pf * TS), math.exp(-p1 * TS)
         return {
-            "KB": kii, "kp_th": vals["KP_THETA"], "sat_r": vals["R_THETA_LIM"], "u_lim": vals["U_LIM"],
+            "KB": kii, "kp_th": self.kp_th, "sat_r": self.sat_r, "u_lim": self.u_lim,
+            "use_fx": self.use_fx, "p1": p1, "pf": pf, "k_gain": k_gain,
             "bF1": 1.0 - ez, "aF1": -ez,
             "bC0": k_gain, "bC1": -k_gain * (1.0 - (z1 / p1) * (1.0 - ep)), "aC1": -ep,
         }
@@ -225,7 +250,10 @@ class DemoLink(Link):
             t = k * TS
             if t >= 1.0 and (t - 1.0) % 5.0 < TS / 2:               # every 5 s: new step (change <= 0.5)
                 r_x = float(np.clip(r_x + rng.uniform(-0.5, 0.5), -0.8, 0.8))
-            r_xf = p["bF1"] * rx_prev - p["aF1"] * rxf_prev         # pre-filter Fx(z)
+            if p["use_fx"]:
+                r_xf = p["bF1"] * rx_prev - p["aF1"] * rxf_prev     # pre-filter Fx(z)
+            else:
+                r_xf = r_x
             rx_prev, rxf_prev = r_x, r_xf
             e = r_xf - x
             r_th_unsat = p["bC0"] * e + p["bC1"] * e_prev - p["aC1"] * u_prev   # controller Cx(z)
@@ -343,6 +371,40 @@ def run_gui(port, demo=False, speed=1.0):
     bar2.pack(fill="x")
     lbl_read = ttk.Label(bar2, text="", width=48)
 
+    if demo:
+        sim0 = DemoLink._read_control_defaults()
+        v_z1 = tk.StringVar(value=f"{sim0['CTRL_Z1']:g}")
+        v_alfa = tk.StringVar(value=f"{sim0['CTRL_ALFA']:g}")
+        v_kii = tk.StringVar(value=f"{sim0['CTRL_KII']:g}")
+        v_fx_mult = tk.StringVar(value=f"{sim0['CTRL_FX_MULT']:g}")
+        v_kp = tk.StringVar(value=f"{sim0['KP_THETA']:g}")
+        v_fx = tk.BooleanVar(value=True)
+        bar_sim = ttk.Frame(root, padding=(6, 0, 6, 6))
+        bar_sim.pack(fill="x")
+        lbl_sim = ttk.Label(bar_sim, text="", width=34)
+    else:
+        bar_sim = None
+
+    def apply_sim():
+        if not demo:
+            return True
+        k = st["link"]
+        if not isinstance(k, DemoLink):
+            return False
+        try:
+            z1 = float(v_z1.get())
+            alfa = float(v_alfa.get())
+            kii = float(v_kii.get())
+            fx_mult = float(v_fx_mult.get())
+            kp = float(v_kp.get())
+            k.set_sim_params(z1, alfa, kii, kp, fx_mult, v_fx.get())
+        except ValueError as e:
+            lbl.config(text=f"sim error: {e}", foreground=ERR)
+            return False
+        p = k._control_params()
+        lbl_sim.config(text=f"p1 = {p['p1']:.3g}   pf = {p['pf']:.3g}   k = {p['k_gain']:.3f}")
+        return True
+
     def apply_x():
         """sends xmin/xmax (V, channel 2 voltage) to the firmware, which normalizes x to [-1, 1]"""
         k = st["link"]
@@ -405,13 +467,14 @@ def run_gui(port, demo=False, speed=1.0):
         v_rth.set(f"{st['link'].rth:g}")
         lbl.config(text=f"connected ({cb.get()}) — mode {st['link'].mode} ({MODES.get(st['link'].mode, '?')})", foreground="")
         apply_x()
+        apply_sim()
 
     def start():
         k = st["link"]
         if not k:
             lbl.config(text="connect the port first", foreground=ERR)
             return
-        if not apply_x():
+        if not apply_x() or not apply_sim():
             return
         try:
             k.send(f"A{int(round(float(v_rx.get()) * 1000))}")
@@ -457,6 +520,21 @@ def run_gui(port, demo=False, speed=1.0):
     ttk.Button(bar2, text="Read → xmin", command=lambda: use_as(v_xmin)).pack(side="left", padx=2)
     ttk.Button(bar2, text="Read → xmax", command=lambda: use_as(v_xmax)).pack(side="left")
     lbl_read.pack(side="left", padx=10)
+
+    if demo:
+        ttk.Label(bar_sim, text="Sim controller:  z1").pack(side="left")
+        ttk.Entry(bar_sim, textvariable=v_z1, width=6).pack(side="left")
+        ttk.Label(bar_sim, text="  alfa").pack(side="left")
+        ttk.Entry(bar_sim, textvariable=v_alfa, width=6).pack(side="left")
+        ttk.Label(bar_sim, text="  kii (K_B)").pack(side="left")
+        ttk.Entry(bar_sim, textvariable=v_kii, width=6).pack(side="left")
+        ttk.Label(bar_sim, text="  m_Fx (*z1)").pack(side="left")
+        ttk.Entry(bar_sim, textvariable=v_fx_mult, width=6).pack(side="left")
+        ttk.Label(bar_sim, text="  Kp_θ").pack(side="left")
+        ttk.Entry(bar_sim, textvariable=v_kp, width=6).pack(side="left")
+        ttk.Checkbutton(bar_sim, text="Fx (pré-filtro)", variable=v_fx, command=apply_sim).pack(side="left", padx=6)
+        ttk.Button(bar_sim, text="Apply Sim", command=apply_sim).pack(side="left", padx=4)
+        lbl_sim.pack(side="left", padx=8)
 
     fig = Figure(figsize=(8.5, 6.2), dpi=100)
     ax = fig.subplots(3, 1, sharex=True)

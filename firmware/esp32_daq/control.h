@@ -76,17 +76,18 @@ float reference_x(float t, float step) {
 
 /* ---------------------------------------------------------------- outer loop (MODEs 1 and 2) */
 /* 2-DOF controller parameters (from MATLAB):
- *   z1   = 1.0
- *   alfa = 7.5
- *   kii  = 1.4  (K_B)
- *   p1   = alfa * z1 = 7.5
- *   k    = alfa^(3/2) * z1^2 / kii = 14.671140
- *   Fx(s) = z1 / (s + z1)
- *   Cx(s) = k * (s + z1) / (s + p1)
+ *   z1      = 1.0
+ *   alfa    = 6.1
+ *   kii     = 1.4  (K_B)
+ *   fx_mult = 1.0  (pre-filter pole multiplier: pf = fx_mult * z1)
+ *   p1      = alfa * z1
+ *   k       = alfa^(3/2) * z1^2 / kii
+ *   Fx(s)   = (fx_mult * z1) / (s + fx_mult * z1)
+ *   Cx(s)   = k * (s + z1) / (s + p1)
  *
  * Both Fx(s) and Cx(s) are discretized with c2d(..., TS, 'zoh') at TS = 0.05 s
  * inside control_reset() from the parameters below (normalized by a[0] = 1):
- *   Fd(z): bF = { 0, 1 - exp(-z1*TS) },                    aF = { 1, -exp(-z1*TS) }
+ *   Fd(z): bF = { 0, 1 - exp(-pf*TS) },                    aF = { 1, -exp(-pf*TS) }
  *   Cd(z): bC = { k, -k*(1 - (z1/p1)*(1 - exp(-p1*TS))) }, aC = { 1, -exp(-p1*TS) }
  *
  * Difference equations:
@@ -94,9 +95,10 @@ float reference_x(float t, float step) {
  *   e[k]    = r_xf[k] - x[k]
  *   u[k]    = bC[0]*e[k] + bC[1]*e[k-1] - aC[1]*u[k-1]
  * ORDER = 1. All states are cleared in control_reset(). */
-static const float CTRL_Z1   = 1.0f;                 /* zero of Cx(s) and pole of Fx(s) */
-static const float CTRL_ALFA = 6.1f;                 /* lead ratio (p1 = alfa * z1) */
-static const float CTRL_KII  = 1.4f;                 /* plant gain K_B */
+static const float CTRL_Z1      = 1.0f;              /* zero of Cx(s) and base pole of Fx(s) */
+static const float CTRL_ALFA    = 6.1f;              /* lead ratio (p1 = alfa * z1) */
+static const float CTRL_KII     = 1.4f;              /* plant gain K_B */
+static const float CTRL_FX_MULT = 1.0f;              /* multiplier of z1 in Fx(s) = (m*z1)/(s + m*z1) */
 
 #define ORDER 1
 static float bF[2];                                  /* pre-filter Fx(z) numerator */
@@ -110,11 +112,12 @@ static float u_h[ORDER + 1];                         /* u[k], u[k-1], ... */
 
 void control_reset() {
   float p1 = CTRL_ALFA * CTRL_Z1;
+  float pf = CTRL_FX_MULT * CTRL_Z1;
   float k  = powf(CTRL_ALFA, 1.5f) * (CTRL_Z1 * CTRL_Z1) / CTRL_KII;
-  float ez = expf(-CTRL_Z1 * TS);
+  float ez = expf(-pf * TS);
   float ep = expf(-p1 * TS);
 
-  /* Discretized pre-filter Fx(s) = z1 / (s + z1) via ZOH */
+  /* Discretized pre-filter Fx(s) = pf / (s + pf) via ZOH */
   bF[0] = 0.0f;
   bF[1] = 1.0f - ez;
   aF[0] = 1.0f;
